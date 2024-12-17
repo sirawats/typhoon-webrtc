@@ -8,16 +8,17 @@ from aiortc import (
 )
 from av.video.frame import VideoFrame
 import socketio
+from fractions import Fraction
 
 
 class BlueVideoStreamTrack(VideoStreamTrack):
     def __init__(self):
         super().__init__()
-        # Create blue frame (RGB format)
-        # self.img = np.zeros((480, 640, 3), dtype=np.uint8)
-        self.img = np.zeros((5, 5, 3), dtype=np.uint8)
-        self.img[:, :] = [0, 0, 255]  # RGB format
+        # Create blue frame with proper size for video
+        self.img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.img[:, :] = [0, 0, 255]  # RGB format - bright blue
         self.pts = 0
+        self.time_base = Fraction(1, 30)  # 30 fps
 
     async def recv(self):
         pts, time_base = await self.next_timestamp()
@@ -31,15 +32,25 @@ class WebRTCBot:
     def __init__(self):
         self.sio = socketio.AsyncClient(
             reconnection=True,
-            reconnection_attempts=0,  # Infinite retries
+            reconnection_attempts=0,
             reconnection_delay=1,
             logger=True,
         )
         self.pc = None
         self.track = None
-        self.running = True  # Flag to control the main loop
+        self.running = True
 
-        self._stop = False
+    async def cleanup(self):
+        """Cleanup resources"""
+        self.running = False
+        if self.track:
+            self.track.stop()
+            self.track = None
+        if self.pc:
+            await self.pc.close()
+            self.pc = None
+        if self.sio.connected:
+            await self.sio.disconnect()
 
     def setup_events(self):
         @self.sio.event
@@ -66,6 +77,7 @@ class WebRTCBot:
                         candidate=data["candidate"]["candidate"],
                     )
                     await self.pc.addIceCandidate(candidate)
+                    print("Added ICE candidate")
                 except Exception as e:
                     print(f"Error adding ICE candidate: {e}")
 
@@ -74,23 +86,28 @@ class WebRTCBot:
             print(f"Users in room: {users}")
 
     async def create_peer_connection(self):
+        if self.pc:
+            await self.pc.close()
+
         self.pc = RTCPeerConnection()
         print("Created peer connection")
+
+        @self.pc.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange():
+            if self.pc:
+                print(f"ICE Connection state: {self.pc.iceConnectionState}")
+
+        @self.pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            if self.pc:
+                print(f"Connection state: {self.pc.connectionState}")
+                if self.pc.connectionState == "failed":
+                    await self.cleanup()
 
         # Add video track
         self.track = BlueVideoStreamTrack()
         self.pc.addTrack(self.track)
         print("Added video track")
-
-        @self.pc.on("iceconnectionstatechange")
-        async def on_iceconnectionstatechange():
-            print(f"ICE Connection state: {self.pc.iceConnectionState}")
-
-        @self.pc.on("connectionstatechange")
-        async def on_connectionstatechange():
-            print(f"Connection state: {self.pc.connectionState}")
-
-        return self.pc
 
     async def join_room(self):
         await self.sio.emit("join_room", {"room": "test-room", "email": "TYPHOON_BOT"})
@@ -102,7 +119,17 @@ class WebRTCBot:
             await self.create_peer_connection()
 
             print("Processing offer")
-            offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
+            print("Offer data:", data)  # Debug print
+
+            # Extract SDP correctly
+            sdp = data.get("sdp")
+            if isinstance(sdp, dict):
+                sdp = sdp.get("sdp", "")
+
+            print(f"SDP type: {type(sdp)}")  # Debug print
+            print(f"SDP content: {sdp[:100]}...")  # Show first 100 chars
+
+            offer = RTCSessionDescription(sdp=sdp, type="offer")
             await self.pc.setRemoteDescription(offer)
 
             print("Creating answer")
@@ -124,9 +151,8 @@ class WebRTCBot:
 
         except Exception as e:
             print(f"Error handling offer: {e}")
-            if self.pc:
-                await self.pc.close()
-                self.pc = None
+            print(f"Full offer data: {data}")  # Print full data on error
+            await self.cleanup()
 
     async def run(self):
         self.setup_events()
@@ -136,17 +162,10 @@ class WebRTCBot:
                     await self.sio.connect(
                         "http://localhost:8080", transports=["websocket"]
                     )
-                # Keep program alive but don't spam reconnections
                 await asyncio.sleep(1)
             except Exception as e:
                 print(f"Connection error: {e}")
-
-    async def stop(self):
-        self._stop = True
-        if self.pc:
-            await self.pc.close()
-        if self.sio.connected:
-            await self.sio.disconnect()
+                await asyncio.sleep(1)
 
 
 async def main():
@@ -154,8 +173,8 @@ async def main():
     try:
         await bot.run()
     except KeyboardInterrupt:
-        bot.running = False
-        print("\nBot stopped by user")
+        print("\nStopping bot...")
+        await bot.cleanup()
 
 
 if __name__ == "__main__":
